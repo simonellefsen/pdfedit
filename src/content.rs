@@ -63,11 +63,29 @@ pub struct ImagePlacement {
     pub quad: [[f32; 2]; 4],
 }
 
+/// A thin straight line (a rule), such as the one under a running header.
+#[derive(Debug, Clone)]
+pub struct Rule {
+    /// First and last operator (inclusive) that draw it.
+    pub ops: (usize, usize),
+    /// Corners of its bounding box in user space.
+    pub quad: [[f32; 2]; 4],
+}
+
 /// Result of scanning a page's content.
 #[derive(Debug, Clone, Default)]
 pub struct PageScan {
     pub runs: Vec<TextRun>,
     pub images: Vec<ImagePlacement>,
+    pub rules: Vec<Rule>,
+}
+
+/// The path under construction, while it is still a lone rectangle or a
+/// single line segment drawn by consecutive operators.
+struct SimplePath {
+    start: usize,
+    ops: usize,
+    points: Vec<[f32; 2]>,
 }
 
 #[derive(Clone)]
@@ -122,10 +140,74 @@ pub fn scan(ops: &[Operation], fonts: &HashMap<Vec<u8>, Rc<FontInfo>>) -> PageSc
     let mut stack: Vec<State> = Vec::new();
     let mut tm = IDENTITY;
     let mut tlm = IDENTITY;
+    let mut path: Option<SimplePath> = None;
+    let mut path_ops = 0usize;
 
     for (index, op) in ops.iter().enumerate() {
         let a = &op.operands;
         match op.operator.as_str() {
+            "re" | "m" | "l" | "c" | "v" | "y" | "h" => {
+                let m = &state.ctm;
+                match (op.operator.as_str(), path_ops, &mut path) {
+                    ("re", 0, _) => {
+                        if let Some([x, y, w, h]) = nums::<4>(a) {
+                            path = Some(SimplePath {
+                                start: index,
+                                ops: 1,
+                                points: vec![
+                                    apply(m, x, y),
+                                    apply(m, x + w, y),
+                                    apply(m, x + w, y + h),
+                                    apply(m, x, y + h),
+                                ],
+                            });
+                        }
+                    }
+                    ("m", 0, _) => {
+                        if let Some([x, y]) = nums::<2>(a) {
+                            path = Some(SimplePath {
+                                start: index,
+                                ops: 1,
+                                points: vec![apply(m, x, y)],
+                            });
+                        }
+                    }
+                    ("l", 1, Some(p)) if p.points.len() == 1 => {
+                        if let Some([x, y]) = nums::<2>(a) {
+                            p.points.push(apply(m, x, y));
+                            p.ops = 2;
+                        }
+                    }
+                    _ => path = None,
+                }
+                path_ops += 1;
+            }
+            "f" | "F" | "f*" | "B" | "B*" | "b" | "b*" | "S" | "s" | "n" => {
+                if let Some(p) = path.take()
+                    && op.operator != "n"
+                    && index == p.start + p.ops
+                    && p.points.len() >= 2
+                {
+                    let xs = p.points.iter().map(|q| q[0]);
+                    let ys = p.points.iter().map(|q| q[1]);
+                    let (x0, x1) = (
+                        xs.clone().fold(f32::MAX, f32::min),
+                        xs.fold(f32::MIN, f32::max),
+                    );
+                    let (y0, y1) = (
+                        ys.clone().fold(f32::MAX, f32::min),
+                        ys.fold(f32::MIN, f32::max),
+                    );
+                    let (w, h) = (x1 - x0, y1 - y0);
+                    if w.min(h) <= 2.0 && w.max(h) >= 40.0 {
+                        out.rules.push(Rule {
+                            ops: (p.start, index),
+                            quad: [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+                        });
+                    }
+                }
+                path_ops = 0;
+            }
             "q" => stack.push(state.clone()),
             "Q" => {
                 if let Some(s) = stack.pop() {
@@ -299,16 +381,37 @@ fn string_object(bytes: Vec<u8>, hex: bool) -> Object {
     Object::String(bytes, format)
 }
 
+/// Width of TJ items in text-space units for a font size.
+fn items_width(items: &[Object], font: &FontInfo, size: f32) -> f32 {
+    let mut width = 0.0;
+    for item in items {
+        match item {
+            Object::String(bytes, _) => {
+                for code in font.codes(bytes) {
+                    width += font.width(code) / 1000.0 * size;
+                }
+            }
+            other => width -= num(other) as f32 / 1000.0 * size,
+        }
+    }
+    width
+}
+
 /// Replace the text shown by `run` with `text`.
 ///
-/// `fallback_res` is the resource name of a WinAnsi standard font that is used
-/// when the run's own font cannot encode the new text.
+/// `fallback` is the resource name and metrics of a WinAnsi standard font
+/// that is used when the run's own font cannot encode the new text.
+///
+/// `fit` keeps centred or right-aligned text in place: it is the width (in
+/// text-space units) the text used to span and the share of any width
+/// change to shift the start by (0.5 centres, 1.0 keeps the right edge).
 pub fn replace_run_text(
     ops: &mut Vec<Operation>,
     run: &TextRun,
     font: Option<&FontInfo>,
     text: &str,
-    fallback_res: &[u8],
+    fallback: (&[u8], &FontInfo),
+    fit: Option<(f32, f32)>,
 ) -> EditOutcome {
     let old = ops[run.op_index].clone();
     let mut new_ops: Vec<Operation> = Vec::new();
@@ -325,10 +428,25 @@ pub fn replace_run_text(
         _ => {}
     }
 
-    let encoded = font.and_then(|font| encode_with_font(font, text));
+    let show = |mut items: Vec<Object>, font: &FontInfo| {
+        if let Some((old_width, share)) = fit
+            && run.tf_size != 0.0
+            && !items.is_empty()
+        {
+            let shift = (old_width - items_width(&items, font, run.tf_size)) * share;
+            items.insert(0, Object::Real(-shift / run.tf_size * 1000.0));
+        }
+        if let [single @ Object::String(..)] = items.as_slice() {
+            Operation::new("Tj", vec![single.clone()])
+        } else {
+            Operation::new("TJ", vec![Object::Array(items)])
+        }
+    };
+
+    let encoded = font.and_then(|font| Some((encode_with_font(font, text)?, font)));
     let outcome = match encoded {
-        Some(op) => {
-            new_ops.push(op);
+        Some((items, font)) => {
+            new_ops.push(show(items, font));
             EditOutcome::OriginalFont
         }
         None => {
@@ -341,11 +459,11 @@ pub fn replace_run_text(
             let size = Object::Real(run.tf_size);
             new_ops.push(Operation::new(
                 "Tf",
-                vec![Object::Name(fallback_res.to_vec()), size.clone()],
+                vec![Object::Name(fallback.0.to_vec()), size.clone()],
             ));
-            new_ops.push(Operation::new(
-                "Tj",
+            new_ops.push(show(
                 vec![string_object(win_ansi_encode(text), false)],
+                fallback.1,
             ));
             new_ops.push(Operation::new(
                 "Tf",
@@ -358,14 +476,11 @@ pub fn replace_run_text(
     outcome
 }
 
-/// Encode with the run's font. Spaces the font has no glyph for become
-/// kerning gaps in a `TJ` array, which is how such PDFs space words anyway.
-fn encode_with_font(font: &FontInfo, text: &str) -> Option<Operation> {
+/// Encode with the run's font, as `TJ` items. Spaces the font has no glyph
+/// for become kerning gaps, which is how such PDFs space words anyway.
+fn encode_with_font(font: &FontInfo, text: &str) -> Option<Vec<Object>> {
     if let Ok(bytes) = font.encode(text) {
-        return Some(Operation::new(
-            "Tj",
-            vec![string_object(bytes, font.two_byte)],
-        ));
+        return Some(vec![string_object(bytes, font.two_byte)]);
     }
     if font.can_encode(' ') {
         return None;
@@ -379,5 +494,5 @@ fn encode_with_font(font: &FontInfo, text: &str) -> Option<Operation> {
             items.push(string_object(font.encode(word).ok()?, font.two_byte));
         }
     }
-    Some(Operation::new("TJ", vec![Object::Array(items)]))
+    Some(items)
 }

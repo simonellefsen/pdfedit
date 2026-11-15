@@ -6,4 +6,5 @@
 pub mod content;
 pub mod doc;
 pub mod font;
+pub mod headers;
 pub mod markdown;

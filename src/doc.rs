@@ -46,14 +46,29 @@ impl PageGeom {
     }
 }
 
+/// A page dictionary as it was before an edit.
+type PageState = (usize, Dictionary);
+
+/// A text replacement for one run.
+#[derive(Debug, Clone)]
+pub struct RunEdit {
+    pub page: usize,
+    pub run: usize,
+    pub text: String,
+    /// Keeps centred or right-aligned text in place: the width (in page
+    /// units) the text used to span, and the share of any width change to
+    /// shift the start by (0.5 centres, 1.0 keeps the right edge).
+    pub fit: Option<(f32, f32)>,
+}
+
 /// An open PDF document.
 pub struct PdfDoc {
     inner: Document,
     pages: Vec<ObjectId>,
     fonts: HashMap<ObjectId, Rc<FontInfo>>,
     scans: HashMap<usize, Rc<PageScan>>,
-    undo: Vec<(usize, Dictionary)>,
-    redo: Vec<(usize, Dictionary)>,
+    undo: Vec<Vec<PageState>>,
+    redo: Vec<Vec<PageState>>,
     /// Whether there are unsaved changes.
     pub dirty: bool,
 }
@@ -220,6 +235,101 @@ impl PdfDoc {
         run_index: usize,
         text: &str,
     ) -> Result<EditOutcome> {
+        let (outcome, before) = self.edit_run(page, run_index, text, None)?;
+        self.undo.push(vec![before]);
+        self.redo.clear();
+        Ok(outcome)
+    }
+
+    /// Replace the text of many runs as a single undo step. Returns how many needed the fallback font. If any
+    /// edit fails, none are kept.
+    pub fn set_many(&mut self, edits: &[RunEdit]) -> Result<usize> {
+        self.apply_batch(&[], edits)
+    }
+
+    /// Delete operator ranges and replace run texts as a single undo step.
+    ///
+    /// `drops` lists, per page, inclusive operator ranges to delete (see
+    /// [`crate::content::Rule::ops`]). Returns how many text edits needed the
+    /// fallback font. If anything fails, nothing is kept.
+    pub fn apply_batch(
+        &mut self,
+        drops: &[(usize, Vec<(usize, usize)>)],
+        edits: &[RunEdit],
+    ) -> Result<usize> {
+        let mut group = Vec::new();
+        // Operators go first: removing them does not renumber text runs,
+        // whereas text edits do move operators.
+        for (page, ranges) in drops {
+            match self.drop_ops(*page, ranges) {
+                Ok(before) => group.push(before),
+                Err(e) => {
+                    self.swap_group(group);
+                    return Err(e);
+                }
+            }
+        }
+        // Later runs first: emptying a run removes it and shifts the rest.
+        let mut order: Vec<&RunEdit> = edits.iter().collect();
+        order.sort_by(|a, b| a.page.cmp(&b.page).then(b.run.cmp(&a.run)));
+        let mut fallbacks = 0;
+        for edit in order {
+            match self.edit_run(edit.page, edit.run, &edit.text, edit.fit) {
+                Ok((outcome, before)) => {
+                    group.push(before);
+                    if matches!(outcome, EditOutcome::FallbackFont(_)) {
+                        fallbacks += 1;
+                    }
+                }
+                Err(e) => {
+                    self.swap_group(group);
+                    return Err(e);
+                }
+            }
+        }
+        if !group.is_empty() {
+            self.undo.push(group);
+            self.redo.clear();
+        }
+        Ok(fallbacks)
+    }
+
+    fn drop_ops(&mut self, page: usize, ranges: &[(usize, usize)]) -> Result<PageState> {
+        let page_id = self.page_id(page).ok_or_else(|| anyhow!("no such page"))?;
+        let mut content = self.content(page)?;
+        let mut ranges = ranges.to_vec();
+        ranges.sort_unstable_by(|a, b| b.cmp(a));
+        for (start, end) in ranges {
+            if start > end || end >= content.operations.len() {
+                bail!("page content changed unexpectedly");
+            }
+            content.operations.drain(start..=end);
+        }
+        let before = self.inner.get_dictionary(page_id)?.clone();
+        self.write_content(page, page_id, &content)?;
+        Ok((page, before))
+    }
+
+    fn write_content(&mut self, page: usize, page_id: ObjectId, content: &Content) -> Result<()> {
+        let encoded = content.encode().context("encoding page content")?;
+        let mut stream = Stream::new(dictionary! {}, encoded);
+        let _ = stream.compress();
+        let stream_id = self.inner.add_object(stream);
+        self.inner
+            .get_dictionary_mut(page_id)?
+            .set("Contents", Object::Reference(stream_id));
+        self.scans.remove(&page);
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn edit_run(
+        &mut self,
+        page: usize,
+        run_index: usize,
+        text: &str,
+        fit: Option<(f32, f32)>,
+    ) -> Result<(EditOutcome, PageState)> {
         let page_id = self.page_id(page).ok_or_else(|| anyhow!("no such page"))?;
         let scan = self.scan(page);
         let run = scan
@@ -242,25 +352,16 @@ impl PdfDoc {
             &run,
             font.map(Rc::as_ref),
             text,
-            fallback_res.as_bytes(),
+            (fallback_res.as_bytes(), &FontInfo::win_ansi(fallback_base)),
+            fit.filter(|_| run.size > 0.0)
+                .map(|(width, share)| (width * run.tf_size.abs() / run.size, share)),
         );
         if matches!(outcome, EditOutcome::FallbackFont(_)) {
             self.add_fallback_font(page, page_id, &fallback_res, fallback_base)?;
         }
 
-        let encoded = content.encode().context("encoding page content")?;
-        let mut stream = Stream::new(dictionary! {}, encoded);
-        let _ = stream.compress();
-        let stream_id = self.inner.add_object(stream);
-        self.inner
-            .get_dictionary_mut(page_id)?
-            .set("Contents", Object::Reference(stream_id));
-
-        self.undo.push((page, before));
-        self.redo.clear();
-        self.scans.remove(&page);
-        self.dirty = true;
-        Ok(outcome)
+        self.write_content(page, page_id, &content)?;
+        Ok((outcome, (page, before)))
     }
 
     /// Give the page its own resource dictionary containing a standard font.
@@ -293,32 +394,47 @@ impl PdfDoc {
         Ok(())
     }
 
-    fn swap_page(&mut self, entry: (usize, Dictionary)) -> Option<(usize, Dictionary)> {
-        let (page, dict) = entry;
-        let id = self.page_id(page)?;
-        let current = self.inner.get_dictionary_mut(id).ok()?;
-        let previous = std::mem::replace(current, dict);
-        self.scans.remove(&page);
+    /// Restore the page states of a group (newest first) and return the
+    /// states they replaced, ordered so that swapping again reverses it.
+    fn swap_group(&mut self, group: Vec<PageState>) -> Vec<PageState> {
+        let mut replaced = Vec::new();
+        for (page, dict) in group.into_iter().rev() {
+            let Some(id) = self.page_id(page) else {
+                continue;
+            };
+            let Ok(current) = self.inner.get_dictionary_mut(id) else {
+                continue;
+            };
+            replaced.push((page, std::mem::replace(current, dict)));
+            self.scans.remove(&page);
+        }
         self.dirty = true;
-        Some((page, previous))
+        replaced
     }
 
-    /// Undo the last edit; returns the affected page.
-    pub fn undo(&mut self) -> Option<usize> {
-        let entry = self.undo.pop()?;
-        let swapped = self.swap_page(entry)?;
-        let page = swapped.0;
-        self.redo.push(swapped);
-        Some(page)
+    fn pages_of(group: &[PageState]) -> Vec<usize> {
+        let mut pages: Vec<usize> = group.iter().map(|(page, _)| *page).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        pages
     }
 
-    /// Redo the last undone edit; returns the affected page.
-    pub fn redo(&mut self) -> Option<usize> {
-        let entry = self.redo.pop()?;
-        let swapped = self.swap_page(entry)?;
-        let page = swapped.0;
-        self.undo.push(swapped);
-        Some(page)
+    /// Undo the last edit; returns the affected pages.
+    pub fn undo(&mut self) -> Option<Vec<usize>> {
+        let group = self.undo.pop()?;
+        let replaced = self.swap_group(group);
+        let pages = Self::pages_of(&replaced);
+        self.redo.push(replaced);
+        Some(pages)
+    }
+
+    /// Redo the last undone edit; returns the affected pages.
+    pub fn redo(&mut self) -> Option<Vec<usize>> {
+        let group = self.redo.pop()?;
+        let replaced = self.swap_group(group);
+        let pages = Self::pages_of(&replaced);
+        self.undo.push(replaced);
+        Some(pages)
     }
 
     pub fn can_undo(&self) -> bool {
@@ -341,7 +457,7 @@ impl PdfDoc {
         let mut copy = self.inner.clone();
         copy.prune_objects();
         let mut buf = Vec::new();
-        copy.save_to(&mut buf).context("serializing PDF")?;
+        copy.save_modern(&mut buf).context("serializing PDF")?;
         let tmp = path.with_extension("pdf.tmp");
         std::fs::write(&tmp, &buf).with_context(|| format!("writing {}", tmp.display()))?;
         std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;

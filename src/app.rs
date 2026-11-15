@@ -11,6 +11,7 @@ use eframe::egui::{
 
 use pdfedit::content::{EditOutcome, TextRun};
 use pdfedit::doc::{PageGeom, PdfDoc};
+use pdfedit::headers::{self, Group, Zone};
 use pdfedit::markdown;
 
 use crate::render::{RenderRequest, Renderer};
@@ -44,6 +45,16 @@ enum Action {
     StartEdit { page: usize, run: usize },
     CommitEdit,
     CancelEdit,
+    RemoveHeadersFooters { headers: bool, footers: bool },
+    OpenHeaderDialog,
+    ApplyHeaderDialog,
+}
+
+/// One row of the header/footer dialog.
+struct HeaderRow {
+    group: Group,
+    text: String,
+    remove: bool,
 }
 
 pub struct App {
@@ -67,6 +78,7 @@ pub struct App {
     editing: Option<Editing>,
     status: String,
     title: String,
+    header_dialog: Option<Vec<HeaderRow>>,
     script: Option<Script>,
 }
 
@@ -93,6 +105,7 @@ impl App {
             editing: None,
             status: "Open a PDF to get started (or drop one on the window).".into(),
             title: String::new(),
+            header_dialog: None,
             script: Script::from_env(),
         };
         if let Some(path) = path {
@@ -115,6 +128,7 @@ impl App {
                 self.errors.clear();
                 self.in_flight.clear();
                 self.editing = None;
+                self.header_dialog = None;
                 self.current_page = 0;
                 self.pending_offset = Some(Vec2::ZERO);
             }
@@ -124,15 +138,82 @@ impl App {
 
     /// Re-serialize after a change to `page` so it is rendered again.
     fn page_changed(&mut self, page: usize) {
+        self.pages_changed(&[page]);
+    }
+
+    fn pages_changed(&mut self, pages: &[usize]) {
         let Some(doc) = &mut self.doc else { return };
         match doc.to_bytes() {
             Ok(bytes) => {
                 self.data = Arc::new(bytes);
-                if let Some(v) = self.versions.get_mut(page) {
-                    *v += 1;
+                for page in pages {
+                    if let Some(v) = self.versions.get_mut(*page) {
+                        *v += 1;
+                    }
                 }
             }
             Err(e) => self.status = format!("Could not update the view: {e:#}"),
+        }
+    }
+
+    fn all_pages_changed(&mut self) {
+        let pages: Vec<usize> = (0..self.geoms.len()).collect();
+        self.pages_changed(&pages);
+    }
+
+    /// The window for editing detected headers and footers.
+    fn header_dialog_ui(&mut self, ctx: &egui::Context, actions: &mut Vec<Action>) {
+        let Some(rows) = &mut self.header_dialog else {
+            return;
+        };
+        let mut open = true;
+        let mut close = false;
+        egui::Window::new("Headers & Footers")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(true)
+            .default_width(520.0)
+            .show(ctx, |ui| {
+                ui.label(
+                    "Text that repeats in the top or bottom margin. {n} stands for a number \
+                     that changes from page to page, such as the page number.",
+                );
+                ui.add_space(6.0);
+                egui::ScrollArea::vertical()
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("header-rows")
+                            .num_columns(4)
+                            .show(ui, |ui| {
+                                for row in rows.iter_mut() {
+                                    ui.label(match row.group.zone {
+                                        Zone::Header => "Header",
+                                        Zone::Footer => "Footer",
+                                    });
+                                    ui.add_enabled_ui(!row.remove, |ui| {
+                                        ui.add_sized(
+                                            [340.0, 22.0],
+                                            egui::TextEdit::singleline(&mut row.text),
+                                        );
+                                    });
+                                    ui.weak(format!("{} pages", row.group.page_count()));
+                                    ui.checkbox(&mut row.remove, "Remove");
+                                    ui.end_row();
+                                }
+                            });
+                    });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Apply").clicked() {
+                        actions.push(Action::ApplyHeaderDialog);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        if !open || close {
+            self.header_dialog = None;
         }
     }
 
@@ -229,15 +310,17 @@ impl App {
                 self.editing = None;
                 let Some(doc) = &mut self.doc else { return };
                 let undo = matches!(action, Action::Undo);
-                let page = if undo { doc.undo() } else { doc.redo() };
-                if let Some(page) = page {
-                    self.status = format!(
-                        "{} on page {}",
-                        if undo { "Undo" } else { "Redo" },
-                        page + 1
-                    );
-                    self.page_changed(page);
-                    self.scroll_to = Some(page);
+                let pages = if undo { doc.undo() } else { doc.redo() };
+                if let Some(pages) = pages {
+                    let name = if undo { "Undo" } else { "Redo" };
+                    self.status = match pages.as_slice() {
+                        [page] => format!("{name} on page {}", page + 1),
+                        _ => format!("{name} on {} pages", pages.len()),
+                    };
+                    self.pages_changed(&pages);
+                    if !pages.contains(&self.current_page) {
+                        self.scroll_to = pages.first().copied();
+                    }
                 }
             }
             Action::StartEdit { page, run } => {
@@ -255,6 +338,73 @@ impl App {
             }
             Action::CommitEdit => self.commit_edit(),
             Action::CancelEdit => self.editing = None,
+            Action::RemoveHeadersFooters { headers, footers } => {
+                self.commit_edit();
+                let Some(doc) = &mut self.doc else { return };
+                let what = match (headers, footers) {
+                    (true, true) => "headers and footers",
+                    (true, false) => "headers",
+                    _ => "footers",
+                };
+                match headers::remove(doc, headers, footers) {
+                    Ok(0) => self.status = format!("No repeating {what} found"),
+                    Ok(count) => {
+                        self.status = format!("Removed {what} on {count} pages");
+                        self.all_pages_changed();
+                    }
+                    Err(e) => self.status = format!("Could not remove {what}: {e:#}"),
+                }
+            }
+            Action::OpenHeaderDialog => {
+                self.commit_edit();
+                let Some(doc) = &mut self.doc else { return };
+                let rows: Vec<HeaderRow> = headers::detect(doc)
+                    .into_iter()
+                    .map(|group| HeaderRow {
+                        text: group.template.clone(),
+                        group,
+                        remove: false,
+                    })
+                    .collect();
+                if rows.is_empty() {
+                    self.status = "No repeating headers or footers found".into();
+                } else {
+                    self.header_dialog = Some(rows);
+                }
+            }
+            Action::ApplyHeaderDialog => {
+                let (Some(rows), Some(doc)) = (self.header_dialog.take(), &mut self.doc) else {
+                    return;
+                };
+                let edits: Vec<pdfedit::doc::RunEdit> = rows
+                    .iter()
+                    .filter(|row| row.remove || row.text != row.group.template)
+                    .flat_map(|row| row.group.edits(if row.remove { "" } else { &row.text }))
+                    .collect();
+                // Rules go too once every header (or footer) is being removed.
+                let all_removed = |zone: Zone| {
+                    let mut rows = rows.iter().filter(|r| r.group.zone == zone).peekable();
+                    rows.peek().is_some() && rows.all(|r| r.remove)
+                };
+                let drops =
+                    headers::rule_drops(doc, all_removed(Zone::Header), all_removed(Zone::Footer));
+                if edits.is_empty() {
+                    return;
+                }
+                match doc.apply_batch(&drops, &edits) {
+                    Ok(fallbacks) => {
+                        self.status =
+                            format!("Changed {} pieces of header/footer text", edits.len());
+                        if fallbacks > 0 {
+                            self.status += &format!(
+                                " ({fallbacks} with a standard font: the embedded font lacks some glyphs)"
+                            );
+                        }
+                        self.all_pages_changed();
+                    }
+                    Err(e) => self.status = format!("Could not change headers/footers: {e:#}"),
+                }
+            }
         }
     }
 
@@ -332,6 +482,23 @@ impl App {
                     if ui.button("With images…").clicked() {
                         actions.push(Action::ExportMarkdown { images: true });
                         ui.close();
+                    }
+                });
+                ui.menu_button("Headers & Footers", |ui| {
+                    if ui.button("Edit…").clicked() {
+                        actions.push(Action::OpenHeaderDialog);
+                        ui.close();
+                    }
+                    ui.separator();
+                    for (label, headers, footers) in [
+                        ("Remove all headers", true, false),
+                        ("Remove all footers", false, true),
+                        ("Remove both", true, true),
+                    ] {
+                        if ui.button(label).clicked() {
+                            actions.push(Action::RemoveHeadersFooters { headers, footers });
+                            ui.close();
+                        }
                     }
                 });
             });
@@ -620,6 +787,8 @@ impl eframe::App for App {
                 .rect_filled(ui.max_rect(), 0.0, Color32::from_gray(70));
             self.pages(ui, &mut actions, now);
         });
+
+        self.header_dialog_ui(&ctx, &mut actions);
 
         for action in actions {
             self.run_action(action);
